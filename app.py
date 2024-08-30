@@ -53,26 +53,31 @@ mt5_initialized = False
 # Set of active symbols per client
 client_sessions = defaultdict(set)
 
-def initialize_mt5():
-    global mt5_initialized
-    if not mt5_initialized:
-        if mt5.initialize() and mt5.login(login, password, server):
-            logger.info("MT5 login successful")
-            mt5_initialized = True
-        else:
-            logger.error(f"MT5 login failed, error: {mt5.last_error()}")
-            mt5.shutdown()
-            return False
-    return mt5_initialized
-
-if not initialize_mt5():
-    logger.error("Failed to initialize MT5. Exiting.")
-    quit()
 
 def normalize_symbol(symbol):
     """Normalize the symbol to uppercase and map it using SYMBOL_MAP."""
     symbol = symbol.upper()
     return SYMBOL_MAP.get(symbol, symbol)
+
+
+def get_market_status(symbol):
+    if not initialize_mt5():
+        logger.error("MT5 is not initialized. Cannot get market status.")
+        return "unknown"
+
+    symbol_info = mt5.symbol_info(symbol)
+    if symbol_info is None:
+        logger.error(f"Failed to get symbol info for {symbol}")
+        return "unknown"
+
+    trade_mode = symbol_info.trade_mode
+    if trade_mode == mt5.SYMBOL_TRADE_MODE_FULL:
+        return "open"
+    elif trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        return "closed"
+    else:
+        return "unknown"
+
 
 def get_high_low(symbol):
     try:
@@ -89,33 +94,44 @@ def get_high_low(symbol):
         logger.error(f"Exception occurred while retrieving high/low for {symbol}: {e}")
         return None, None
 
-def get_friday_high_low(symbol):
-    try:
-        now = datetime.now()
-        last_friday = now - timedelta(days=(now.weekday() - 4) % 7)
-        start = datetime.combine(last_friday.date(), datetime.min.time())
-        end = datetime.combine(last_friday.date(), datetime.max.time())
-        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_D1, start, end)
-        if not rates:
-            logger.error(f"Error: Could not retrieve high/low data for {symbol} on Friday. Last error: {mt5.last_error()}")
-            return None, None
-        return rates[0]['high'], rates[0]['low']
-    except Exception as e:
-        logger.error(f"Exception occurred while retrieving Friday high/low for {symbol}: {e}")
-        return None, None
 
-def get_market_status():
-    now_london = datetime.now(timezone.utc).astimezone(pytz_timezone('Europe/London'))
-    close_start = (now_london - timedelta(days=(now_london.weekday() - 4) % 7)).replace(hour=23, minute=59, second=0, microsecond=0)
-    close_end = close_start + timedelta(days=2, hours=23, minutes=59, seconds=59, microseconds=999999)
-    return "closed" if close_start <= now_london <= close_end else "open"
+def store_last_closing_values(symbol):
+    rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_D1, 1, 1)
+    if rates is not None and len(rates) > 0:
+        last_close = rates[0]['close']
+        last_high = rates[0]['high']
+        last_low = rates[0]['low']
+        last_market_update_cache[symbol] = {
+            "close": last_close,
+            "high": last_high,
+            "low": last_low,
+            "stored_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        logger.info(f"Stored last closing values for {symbol}: Close: {last_close}, High: {last_high}, Low: {last_low}")
+    else:
+        logger.error(f"Failed to retrieve last closing values for {symbol}")
 
-def store_last_market_update(symbol, high, low):
-    last_market_update_cache[symbol] = {
-        "high": high,
-        "low": low,
-        "stored_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+
+def initialize_mt5():
+    global mt5_initialized
+    if not mt5_initialized:
+        if mt5.initialize() and mt5.login(login, password, server):
+            logger.info("MT5 login successful")
+            mt5_initialized = True
+            # Store last closing values for all symbols
+            for symbol in SYMBOL_MAP.values():
+                store_last_closing_values(symbol)
+        else:
+            logger.error(f"MT5 login failed, error: {mt5.last_error()}")
+            mt5.shutdown()
+            return False
+    return mt5_initialized
+
+
+if not initialize_mt5():
+    logger.error("Failed to initialize MT5. Exiting.")
+    quit()
+
 
 def update_rates_cache():
     if not initialize_mt5():
@@ -130,30 +146,47 @@ def update_rates_cache():
                     logger.error(f"Error: Symbol {mt5_symbol} is not available.")
                     continue
 
-                tick = mt5.symbol_info_tick(mt5_symbol)
-                if not tick:
-                    logger.error(f"Error: Could not retrieve data for {mt5_symbol}. Last error: {mt5.last_error()}")
-                    continue
+                market_status = get_market_status(mt5_symbol)
 
-                market_status = get_market_status()
-                high, low = get_friday_high_low(mt5_symbol) if market_status == "closed" and datetime.now().weekday() != 0 else get_high_low(mt5_symbol)
-                store_last_market_update(mt5_symbol, high, low)
+                if market_status == "closed":
+                    # If market is closed, use last stored values
+                    if mt5_symbol not in last_market_update_cache:
+                        store_last_closing_values(mt5_symbol)
 
-                data = {
-                    "symbol": REVERSE_SYMBOL_MAP.get(mt5_symbol, symbol).title(),
-                    "bid": tick.bid,
-                    "high": high or 0,
-                    "low": low or 0,
-                    "marketStatus": market_status,
-                }
+                    last_data = last_market_update_cache.get(mt5_symbol, {})
+                    data = {
+                        "symbol": REVERSE_SYMBOL_MAP.get(mt5_symbol, symbol).title(),
+                        "bid": last_data.get('close', 0),
+                        "high": last_data.get('high', 0),
+                        "low": last_data.get('low', 0),
+                        "marketStatus": market_status,
+                    }
+                else:
+                    # If market is open, use live data
+                    tick = mt5.symbol_info_tick(mt5_symbol)
+                    if not tick:
+                        logger.error(f"Error: Could not retrieve data for {mt5_symbol}. Last error: {mt5.last_error()}")
+                        continue
+
+                    high, low = get_high_low(mt5_symbol)
+                    data = {
+                        "symbol": REVERSE_SYMBOL_MAP.get(mt5_symbol, symbol).title(),
+                        "bid": tick.bid,
+                        "high": high or 0,
+                        "low": low or 0,
+                        "marketStatus": market_status,
+                    }
+
                 socketio.emit('market-data', data, room=sid)
             except Exception as e:
                 logger.error(f"Exception occurred while updating rates for {symbol}: {e}")
+
 
 def continuous_update():
     while True:
         update_rates_cache()
         socketio.sleep(0.1)  # 100 milliseconds delay
+
 
 @socketio.on('connect')
 def handle_connect():
@@ -165,13 +198,16 @@ def handle_connect():
     logger.info(f"Client {request.sid} connected with valid secret key.")
     socketio.emit('connected', {'message': 'Connection established with valid secret key.'}, room=request.sid)
 
+
 @socketio.on('request-data')
 def handle_request_data(symbols):
     if not isinstance(symbols, list):
         symbols = [symbols]
     normalized_symbols = set(normalize_symbol(symbol) for symbol in symbols)
     client_sessions[request.sid].update(normalized_symbols)
-    logger.info(f"Client {request.sid} subscribed to symbols: {[REVERSE_SYMBOL_MAP.get(s, s) for s in normalized_symbols]}")
+    logger.info(
+        f"Client {request.sid} subscribed to symbols: {[REVERSE_SYMBOL_MAP.get(s, s) for s in normalized_symbols]}")
+
 
 @socketio.on('stop-data')
 def handle_stop_data(symbols):
@@ -179,20 +215,25 @@ def handle_stop_data(symbols):
         symbols = [symbols]
     normalized_symbols = set(normalize_symbol(symbol) for symbol in symbols)
     client_sessions[request.sid].difference_update(normalized_symbols)
-    logger.info(f"Client {request.sid} unsubscribed from symbols: {[REVERSE_SYMBOL_MAP.get(s, s) for s in normalized_symbols]}")
+    logger.info(
+        f"Client {request.sid} unsubscribed from symbols: {[REVERSE_SYMBOL_MAP.get(s, s) for s in normalized_symbols]}")
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     client_sessions.pop(request.sid, None)
     logger.info(f"Client {request.sid} disconnected and session data cleared.")
 
+
 @app.route('/')
 def index():
     return "Welcome to the MT5 API"
 
+
 @app.route('/favicon.ico')
 def favicon():
     return '', 204
+
 
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
@@ -204,6 +245,7 @@ def handle_http_exception(e):
     })
     response.content_type = "application/json"
     return response
+
 
 if __name__ == "__main__":
     socketio.start_background_task(continuous_update)
